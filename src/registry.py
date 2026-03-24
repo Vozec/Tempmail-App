@@ -4,7 +4,12 @@ Shared provider registry — imported by both api.py and mcp_server.py.
 Circuit breaker: a provider is auto-disabled after MAX_CONSECUTIVE_FAILURES
 consecutive create_email failures. It can be re-enabled manually via the API.
 Manually disabled providers are also skipped by get().
+
+At startup, a background health-check probes all providers and auto-disables
+any that are already unreachable (controlled by HEALTH_CHECK_ON_STARTUP env
+var, default: true).
 """
+import asyncio
 import logging
 import os
 from typing import Optional
@@ -33,10 +38,10 @@ _failures: dict[str, int] = {}
 MAX_CONSECUTIVE_FAILURES = 3
 
 PRIORITY = [
-    "mail.tm",      # clean REST API, real temp domains
     "gmail",        # IMAP +tag aliases (only if creds set)
-    "mailticking",  # Gmail +tag via FlareSolverr
+    "mail.tm",      # clean REST API, real temp domains
     "tempmail.io",  # direct API
+    "mailticking",  # Gmail +tag via FlareSolverr
     "tempmailo",    # FlareSolverr
     "tempail",      # FlareSolverr
 ]
@@ -144,6 +149,21 @@ def provider_status() -> list[dict]:
 # Lifecycle
 # ---------------------------------------------------------------------------
 
+async def _probe_and_disable(name: str, provider: EmailProvider) -> None:
+    """Try create_email; disable the provider if it fails."""
+    try:
+        account = await asyncio.wait_for(provider.create_email(), timeout=30.0)
+        log.info("startup probe: %s OK — %s", name, account.email)
+        # clean up the test address (best-effort)
+        try:
+            await provider.delete_email(account)
+        except Exception:
+            pass
+    except Exception as exc:
+        _disabled.add(name)
+        log.warning("startup probe: %s FAILED (%s) — auto-disabled", name, exc)
+
+
 async def startup() -> None:
     register(TempMailIO())
     register(TempMailoProvider())
@@ -156,6 +176,13 @@ async def startup() -> None:
         log.info("Gmail provider registered")
     else:
         log.info("Gmail provider skipped (GMAIL_EMAIL / GMAIL_APP_PASSWORD not set)")
+
+    if os.getenv("HEALTH_CHECK_ON_STARTUP", "true").lower() not in ("0", "false", "no"):
+        log.info("Running startup health-checks on all providers…")
+        await asyncio.gather(*[
+            _probe_and_disable(name, provider)
+            for name, provider in _providers.items()
+        ])
 
 
 async def shutdown() -> None:
