@@ -68,6 +68,14 @@ class FlareSolverrClient:
             payload["session"] = session_id
         return await self._send(payload)
 
+    async def get_clearance_cookies(self, url: str, session_id: Optional[str] = None) -> dict[str, str]:
+        """
+        Solve a Cloudflare challenge for `url` and return the resulting cookies
+        as a plain {name: value} dict (suitable for httpx `cookies=`).
+        """
+        solution = await self.get(url, session_id=session_id)
+        return {c["name"]: c["value"] for c in solution.get("cookies", [])}
+
     async def health_check(self) -> bool:
         """Ping FlareSolverr's /health endpoint."""
         try:

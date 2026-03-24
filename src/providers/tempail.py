@@ -1,3 +1,4 @@
+import logging
 import os
 import re
 import uuid
@@ -6,6 +7,8 @@ from urllib.parse import urlencode
 
 from .base import Attachment, EmailAccount, EmailProvider, Message
 from ..utils.flaresolverr import FlareSolverrClient
+
+log = logging.getLogger(__name__)
 
 BASE_URL = "https://tempail.com"
 LANG = "en"
@@ -22,11 +25,29 @@ _FORM_HEADERS = {
 # HTML parsers
 # ---------------------------------------------------------------------------
 
+_EMAIL_RE = re.compile(r'^[^@\s<>]+@[^@\s<>]+\.[^@\s<>]{2,}$')
+
+
 def _extract_email(html: str) -> Optional[str]:
-    m = re.search(r'id="eposta_adres"[^>]+value="([^"]+)"', html)
-    if not m:
-        m = re.search(r'value="([^"@\s]+@[^"\s]+)"[^>]+id="eposta_adres"', html)
-    return m.group(1).strip() if m else None
+    # Try known input field patterns first
+    for pat in [
+        r'id="eposta_adres"[^>]+value="([^"]+)"',
+        r'value="([^"@\s]+@[^"\s]+)"[^>]+id="eposta_adres"',
+        r'id=["\']eposta_adres["\'][^>]+value=["\']([^"\']+)["\']',
+        r'name=["\']eposta_adres["\'][^>]+value=["\']([^"\']+)["\']',
+        r'value=["\']([^"\']+)["\'][^>]+name=["\']eposta_adres["\']',
+        # JSON embedded in page
+        r'"email"\s*:\s*"([^"@\s]+@[^"\s"]+)"',
+        r'"adres"\s*:\s*"([^"@\s]+@[^"\s"]+)"',
+        # Generic: any input value that looks like an email
+        r'<input[^>]+value="([^"@\s<>]+@[^"@\s<>]+\.[^"@\s<>]{2,})"',
+    ]:
+        m = re.search(pat, html, re.IGNORECASE)
+        if m:
+            val = m.group(1).strip()
+            if _EMAIL_RE.match(val):
+                return val
+    return None
 
 
 def _extract_oturum(html: str) -> Optional[str]:
@@ -130,11 +151,17 @@ class TempAilProvider(EmailProvider):
         )
         html = solution.get("response", "")
 
+        # Detect bot-protection pages (reCAPTCHA, Datadome, etc.)
+        if "recaptcha" in html.lower() or "verifying your request" in html.lower() or "datadome" in html.lower():
+            log.warning("tempail: bot-check page detected (reCAPTCHA/other), cannot solve. HTML[:200]: %s", html[:200])
+            raise RuntimeError("tempail: bot-check page returned — unsolvable by FlareSolverr")
+
         email = _extract_email(html)
         oturum = _extract_oturum(html)
         tarih = _extract_tarih(html)
 
         if not email:
+            log.warning("tempail: could not extract email. HTML snippet: %s", html[:800])
             raise RuntimeError("tempail: could not extract email from homepage")
         if not oturum:
             raise RuntimeError("tempail: could not extract oturum from homepage")
@@ -251,7 +278,19 @@ class TempAilProvider(EmailProvider):
         return self._domains if self._domains else ["necub.com"]
 
     async def health_check(self) -> bool:
-        return await self._fs.health_check()
+        if not await self._fs.health_check():
+            return False
+        try:
+            sid = f"tempail_hc_{uuid.uuid4().hex[:6]}"
+            await self._fs.create_session(sid)
+            try:
+                solution = await self._fs.get(f"{BASE_URL}/{LANG}/", session_id=sid)
+                html = solution.get("response", "")
+                return bool(_extract_email(html))
+            finally:
+                await self._fs.destroy_session(sid)
+        except Exception:
+            return False
 
     async def aclose(self) -> None:
         if self._session_id:

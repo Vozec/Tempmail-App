@@ -1,4 +1,5 @@
 import json
+import logging
 import os
 import random
 import re
@@ -7,6 +8,8 @@ from typing import Optional
 
 from .base import Attachment, EmailAccount, EmailProvider, Message
 from ..utils.flaresolverr import FlareSolverrClient
+
+log = logging.getLogger(__name__)
 
 BASE_URL = "https://tempmailo.com"
 
@@ -19,6 +22,13 @@ _API_HEADERS = {
     "Origin": BASE_URL,
     "Referer": BASE_URL + "/",
 }
+
+
+_EMAIL_RE = re.compile(r'^[^@\s<>]+@[^@\s<>]+\.[^@\s<>]{2,}$')
+
+
+def _is_email(value: str) -> bool:
+    return bool(_EMAIL_RE.match(value.strip()))
 
 
 def _extract_csrf(html: str) -> Optional[str]:
@@ -124,16 +134,19 @@ class TempMailoProvider(EmailProvider):
             session_id=self._session_id,
         )
         email = solution.get("response", "").strip()
-        if not email or "@" not in email:
-            # Session may have expired — retry once
+        if not _is_email(email):
+            log.warning("tempmailo: /changemail non-email (attempt 1): %r", email[:200])
+            # Session may have expired — retry once with a fresh session
             await self._refresh_session()
+            r2 = f"{random.random():.16f}"
             solution = await self._fs.get(
-                f"{BASE_URL}/changemail?_r={r}",
+                f"{BASE_URL}/changemail?_r={r2}",
                 session_id=self._session_id,
             )
             email = solution.get("response", "").strip()
-        if not email or "@" not in email:
-            raise RuntimeError(f"tempmailo: unexpected response from /changemail: {email!r}")
+        if not _is_email(email):
+            log.warning("tempmailo: /changemail non-email (attempt 2): %r", email[:200])
+            raise RuntimeError(f"tempmailo: /changemail returned non-email: {email[:120]!r}")
         return EmailAccount(email=email, token="", provider=self.name)
 
     async def get_messages(self, account: EmailAccount) -> list[Message]:

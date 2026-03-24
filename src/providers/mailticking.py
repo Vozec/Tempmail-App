@@ -1,27 +1,26 @@
+import asyncio
 import hashlib
-import json
+import logging
 import os
-import uuid
 from typing import Optional
 
-from .base import Attachment, EmailAccount, EmailProvider, Message
+import httpx
+
+from .base import EmailAccount, EmailProvider, Message
 from ..utils.flaresolverr import FlareSolverrClient
+
+log = logging.getLogger(__name__)
 
 BASE_URL = "https://www.mailticking.com"
 
-_API_HEADERS = {
+_HEADERS = {
     "Accept": "*/*",
     "Accept-Language": "fr,fr-FR;q=0.9,en-US;q=0.8,en;q=0.7",
     "Content-Type": "application/json",
     "Origin": BASE_URL,
     "Referer": BASE_URL + "/",
+    "User-Agent": "Mozilla/5.0 (X11; Linux x86_64; rv:148.0) Gecko/20100101 Firefox/148.0",
 }
-
-
-def _email_code(email: str) -> str:
-    """SHA-256 of the email — used by mailticking as the auth token for /get-emails."""
-    return hashlib.sha256(email.encode()).hexdigest()
-
 
 # Mailbox types offered by /get-mailbox:
 #   1 → abc@<temp-domain>      (non-Gmail temp domain)
@@ -29,6 +28,20 @@ def _email_code(email: str) -> str:
 #   3 → a.b.c@gmail.com        (Gmail dot trick)
 #   4 → abc@googlemail.com     (googlemail alias)
 MAILBOX_TYPE_TEMP = "2"
+
+
+def _email_code(email: str) -> str:
+    """SHA-256 of the email — used as the auth token for /get-emails."""
+    return hashlib.sha256(email.encode()).hexdigest()
+
+
+def _is_cf_blocked(resp: httpx.Response) -> bool:
+    """Detect a Cloudflare block/challenge page."""
+    if resp.status_code in (403, 503):
+        return True
+    if resp.status_code == 200 and b"Just a moment" in resp.content:
+        return True
+    return False
 
 
 def _parse_list_item(item: dict, to_addr: str) -> Message:
@@ -48,45 +61,54 @@ class MailTickingProvider(EmailProvider):
     """
     Temp-mail provider for mailticking.com.
 
-    Uses FlareSolverr to bypass Cloudflare.
-
-    create_email flow:
-      POST /get-mailbox {"types":["2"]} → Gmail +tag address
-      POST /activate-email {"email":"..."} → activates it
-
-    delete_email: POST /destroy (body empty) — destroys the active mailbox.
+    Strategy:
+      1. Try httpx directly (preserves Content-Type: application/json).
+      2. If Cloudflare blocks the request, use FlareSolverr to solve the
+         challenge and extract cf_clearance cookies, then retry with httpx
+         using those cookies. This avoids FlareSolverr v2's header removal
+         while still supporting CF-protected scenarios.
 
     The `token` field of EmailAccount is sha256(email), required as `code`
     in POST /get-emails.
 
-    Required env var:
-      FLARESOLVERR_URL  — default: http://localhost:8191
+    Optional env var:
+      FLARESOLVERR_URL — default: http://localhost:8191
     """
 
     name = "mailticking"
 
-    def __init__(self, flaresolverr_url: Optional[str] = None) -> None:
-        url = flaresolverr_url or os.getenv("FLARESOLVERR_URL", "http://localhost:8191")
-        self._fs = FlareSolverrClient(url=url)
-        self._session_id: Optional[str] = None
+    def __init__(
+        self,
+        flaresolverr_url: Optional[str] = None,
+        timeout: float = 15.0,
+    ) -> None:
+        self._client = httpx.AsyncClient(headers=_HEADERS, timeout=timeout)
+        self._fs = FlareSolverrClient(
+            url=flaresolverr_url or os.getenv("FLARESOLVERR_URL", "http://localhost:8191")
+        )
+        self._cf_cookies: dict[str, str] = {}
 
-    # ------------------------------------------------------------------ session
+    # ------------------------------------------------------------------ CF
 
-    async def _init_session(self) -> None:
-        sid = f"mailticking_{uuid.uuid4().hex[:8]}"
-        await self._fs.create_session(sid)
-        self._session_id = sid
+    async def _solve_cf(self) -> None:
+        """Use FlareSolverr to get CF clearance cookies, then cache them."""
+        log.info("mailticking: Cloudflare detected, solving via FlareSolverr…")
+        self._cf_cookies = await self._fs.get_clearance_cookies(BASE_URL)
+        log.info("mailticking: CF clearance obtained (%d cookies)", len(self._cf_cookies))
 
-    async def _ensure_session(self) -> None:
-        if not self._session_id:
-            await self._init_session()
+    async def _get(self, url: str, **kwargs) -> httpx.Response:
+        resp = await self._client.get(url, cookies=self._cf_cookies, **kwargs)
+        if _is_cf_blocked(resp):
+            await self._solve_cf()
+            resp = await self._client.get(url, cookies=self._cf_cookies, **kwargs)
+        return resp
 
-    async def _refresh_session(self) -> None:
-        """Destroy current session and open a fresh one (new email on homepage)."""
-        if self._session_id:
-            await self._fs.destroy_session(self._session_id)
-        self._session_id = None
-        await self._init_session()
+    async def _post(self, url: str, **kwargs) -> httpx.Response:
+        resp = await self._client.post(url, cookies=self._cf_cookies, **kwargs)
+        if _is_cf_blocked(resp):
+            await self._solve_cf()
+            resp = await self._client.post(url, cookies=self._cf_cookies, **kwargs)
+        return resp
 
     # ------------------------------------------------------------------ interface
 
@@ -96,71 +118,76 @@ class MailTickingProvider(EmailProvider):
         max_name_length: int = 10,
         domain: Optional[str] = None,
     ) -> EmailAccount:
-        # Fresh session so the new active_mailbox cookie is clean
-        await self._refresh_session()
-
-        # 1. Get a new mailbox address (type 2 = Gmail +tag, actual temp addresses)
-        solution = await self._fs.post(
+        # 1. Get a new mailbox address
+        resp = await self._post(
             f"{BASE_URL}/get-mailbox",
-            body=json.dumps({"types": [MAILBOX_TYPE_TEMP]}),
-            headers=_API_HEADERS,
-            session_id=self._session_id,
+            json={"types": [MAILBOX_TYPE_TEMP]},
         )
-        try:
-            data = json.loads(solution.get("response", "{}"))
-        except json.JSONDecodeError:
-            data = {}
+        resp.raise_for_status()
+        data = resp.json()
         if not data.get("success"):
-            raise RuntimeError(f"mailticking: /get-mailbox failed: {solution.get('response')}")
+            raise RuntimeError(f"mailticking: /get-mailbox failed: {data}")
         email = data["email"]
 
         # 2. Activate it (sets active_mailbox + temp_mail_history cookies)
-        await self._fs.post(
-            f"{BASE_URL}/activate-email",
-            body=json.dumps({"email": email}),
-            headers=_API_HEADERS,
-            session_id=self._session_id,
-        )
+        await self._post(f"{BASE_URL}/activate-email", json={"email": email})
 
         return EmailAccount(email=email, token=_email_code(email), provider=self.name)
 
+    async def _reactivate(self, email: str) -> None:
+        """Re-activate a mailbox to restore the active_mailbox session cookie."""
+        await self._post(f"{BASE_URL}/activate-email", json={"email": email})
+
     async def get_messages(self, account: EmailAccount) -> list[Message]:
-        await self._ensure_session()
-        body = json.dumps({"email": account.email, "code": account.token})
-        solution = await self._fs.post(
+        resp = await self._post(
             f"{BASE_URL}/get-emails?lang=",
-            body=body,
-            headers=_API_HEADERS,
-            session_id=self._session_id,
+            json={"email": account.email, "code": account.token},
         )
+        if resp.status_code == 400:
+            # Cookie lost (server restart) — solve CF first, then re-activate and retry
+            log.info("mailticking: /get-emails 400, solving CF + re-activating %s", account.email)
+            await self._solve_cf()
+            await self._reactivate(account.email)
+            resp = await self._post(
+                f"{BASE_URL}/get-emails?lang=",
+                json={"email": account.email, "code": account.token},
+            )
+        if resp.status_code == 429:
+            log.warning("mailticking: rate limited, backing off 15s")
+            await asyncio.sleep(15)
+            resp = await self._post(
+                f"{BASE_URL}/get-emails?lang=",
+                json={"email": account.email, "code": account.token},
+            )
+        if not resp.is_success:
+            log.warning("mailticking: /get-emails %d — %s", resp.status_code, resp.text[:300])
+            return []
         try:
-            data = json.loads(solution.get("response", "{}"))
-        except json.JSONDecodeError:
+            data = resp.json()
+        except Exception:
+            log.warning("mailticking: /get-emails non-JSON response — %s", resp.text[:300])
             return []
         if not data.get("success"):
+            log.debug("mailticking: /get-emails success=false — %s", data)
             return []
         return [_parse_list_item(item, account.email) for item in data.get("emails", [])]
 
     async def get_message(self, account: EmailAccount, message_id: str) -> Message:
         """
         Merges metadata from /get-emails (from, subject…) with the HTML body
-        from /mail/gmail-content/{id} since the content endpoint returns
-        empty metadata fields.
+        from /mail/gmail-content/{id}.
         """
-        await self._ensure_session()
-
-        # Fetch body
-        solution = await self._fs.get(
-            f"{BASE_URL}/mail/gmail-content/{message_id}",
-            session_id=self._session_id,
-        )
+        resp = await self._get(f"{BASE_URL}/mail/gmail-content/{message_id}")
+        if not resp.is_success:
+            log.warning("mailticking: /gmail-content %d — %s", resp.status_code, resp.text[:300])
+            raise RuntimeError(f"mailticking: /gmail-content returned {resp.status_code}")
         try:
-            content_data = json.loads(solution.get("response", "{}"))
-        except json.JSONDecodeError:
+            content_data = resp.json()
+        except Exception:
+            log.warning("mailticking: /gmail-content non-JSON — %s", resp.text[:300])
             content_data = {}
         body_html = content_data.get("result", {}).get("content")
 
-        # Find metadata in the message list (best-effort)
         messages = await self.get_messages(account)
         base = next((m for m in messages if m.id == message_id), None)
 
@@ -176,7 +203,6 @@ class MailTickingProvider(EmailProvider):
                 attachments=[],
             )
 
-        # Fallback — content endpoint data only
         result = content_data.get("result", {})
         return Message(
             id=message_id,
@@ -190,31 +216,30 @@ class MailTickingProvider(EmailProvider):
         )
 
     async def delete_email(self, account: EmailAccount) -> bool:
-        """Destroy the active mailbox (POST /destroy — clears active_mailbox cookie)."""
-        await self._ensure_session()
-        solution = await self._fs.post(
+        """Destroy the active mailbox (POST /destroy)."""
+        resp = await self._post(
             f"{BASE_URL}/destroy",
-            body="",
-            headers={
-                **_API_HEADERS,
-                "X-Requested-With": "XMLHttpRequest",
-            },
-            session_id=self._session_id,
+            headers={**_HEADERS, "X-Requested-With": "XMLHttpRequest"},
+            content=b"",
         )
         try:
-            data = json.loads(solution.get("response", "{}"))
-            return bool(data.get("success"))
-        except json.JSONDecodeError:
+            return bool(resp.json().get("success"))
+        except Exception:
             return False
 
     async def get_domains(self) -> list[str]:
-        # mailticking generates dotted aliases of real Gmail addresses
         return ["gmail.com"]
 
     async def health_check(self) -> bool:
-        return await self._fs.health_check()
+        try:
+            resp = await self._post(
+                f"{BASE_URL}/get-mailbox",
+                json={"types": [MAILBOX_TYPE_TEMP]},
+            )
+            return resp.status_code == 200
+        except Exception:
+            return False
 
     async def aclose(self) -> None:
-        if self._session_id:
-            await self._fs.destroy_session(self._session_id)
+        await self._client.aclose()
         await self._fs.aclose()

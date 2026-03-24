@@ -78,8 +78,28 @@ router = APIRouter(prefix="/api")
 
 @router.get("/providers", summary="List providers", tags=["Providers"])
 async def list_providers():
-    """List all loaded providers in priority order."""
-    return registry.list_names()
+    """List all loaded providers with their enabled/failure status."""
+    return registry.provider_status()
+
+
+@router.post("/providers/{name}/disable", summary="Disable provider", tags=["Providers"])
+async def disable_provider(name: str):
+    """Manually disable a provider (skipped in fallback and direct calls)."""
+    try:
+        registry.disable(name)
+    except KeyError as e:
+        raise HTTPException(404, str(e))
+    return {"name": name, "disabled": True}
+
+
+@router.post("/providers/{name}/enable", summary="Enable provider", tags=["Providers"])
+async def enable_provider(name: str):
+    """Re-enable a provider and reset its failure counter."""
+    try:
+        registry.enable(name)
+    except KeyError as e:
+        raise HTTPException(404, str(e))
+    return {"name": name, "disabled": False}
 
 
 @router.post("/email", response_model=AccountBody, summary="Create email", tags=["Email"])
@@ -99,14 +119,23 @@ async def create_email(
             provider = registry.get(name)
         except KeyError as e:
             raise HTTPException(404, str(e))
-        return await provider.create_email(
-            min_name_length=body.min_name_length,
-            max_name_length=body.max_name_length,
-            domain=body.domain,
-        )
+        try:
+            account = await provider.create_email(
+                min_name_length=body.min_name_length,
+                max_name_length=body.max_name_length,
+                domain=body.domain,
+            )
+            registry.record_success(name)
+            return account
+        except Exception as exc:
+            registry.record_failure(name)
+            log.warning("create_email: provider %s failed: %s", name, exc)
+            raise HTTPException(503, f"Provider {name!r} failed: {exc}")
 
     errors: dict[str, str] = {}
     for pname in registry.PRIORITY:
+        if registry.is_disabled(pname):
+            continue
         provider = registry.all_providers().get(pname)
         if provider is None:
             continue
@@ -116,9 +145,11 @@ async def create_email(
                 max_name_length=body.max_name_length,
                 domain=body.domain,
             )
+            registry.record_success(pname)
             log.info("create_email: used provider %s", pname)
             return account
         except Exception as exc:
+            registry.record_failure(pname)
             log.warning("create_email: provider %s failed: %s", pname, exc)
             errors[pname] = str(exc)
 
@@ -184,6 +215,8 @@ async def health():
     Returns 200 if all healthy, 207 (Multi-Status) if some are degraded.
     """
     async def _check(name: str, provider: EmailProvider) -> tuple[str, dict]:
+        if registry.is_disabled(name):
+            return name, {"status": "disabled", "failures": registry._failures.get(name, 0)}
         try:
             ok = await asyncio.wait_for(provider.health_check(), timeout=10.0)
             return name, {"status": "ok" if ok else "degraded"}
@@ -196,7 +229,7 @@ async def health():
         await asyncio.gather(*[_check(n, p) for n, p in registry.all_providers().items()])
     )
 
-    all_ok = all(v["status"] == "ok" for v in results.values())
+    all_ok = all(v["status"] in ("ok", "disabled") for v in results.values())
     return JSONResponse(
         status_code=200 if all_ok else 207,
         content={"healthy": all_ok, "providers": results},
