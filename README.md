@@ -211,22 +211,24 @@ At startup, each provider is probed with a real `create_email` call. Any provide
 
 ## MCP server
 
-The MCP server is exposed automatically at **`/mcp`** (streamable-http transport) when the FastAPI app runs — no separate process needed.
+The MCP server is exposed automatically at **`/mcp/`** (streamable-http transport) when the FastAPI app runs — no separate process needed.
 
 ### HTTP transport (recommended)
 
-Add to your Claude Desktop config (`~/.config/claude/claude_desktop_config.json`):
+Add to your MCP config (`~/.mcp.json` for Claude Code, `~/.config/claude/claude_desktop_config.json` for Claude Desktop):
 
 ```json
 {
   "mcpServers": {
     "tempmail": {
-      "type": "streamable-http",
-      "url": "http://localhost:8000/mcp"
+      "type": "http",
+      "url": "https://your-host/mcp/"
     }
   }
 }
 ```
+
+> **Note:** The trailing slash in `/mcp/` is required.
 
 ### Standalone stdio mode
 
