@@ -165,6 +165,8 @@ async def _probe_and_disable(name: str, provider: EmailProvider) -> None:
 
 
 async def startup() -> None:
+    if _providers:  # already initialised (e.g. mounted inside FastAPI)
+        return
     register(TempMailIO())
     register(TempMailoProvider())
     register(MailTickingProvider())

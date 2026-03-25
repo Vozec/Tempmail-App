@@ -164,6 +164,7 @@ Pin a mailbox server-side so every client can see and reuse it.
 |---|---|---|
 | `GET` | `/api/shared` | List all pinned email accounts |
 | `POST` | `/api/shared` | Pin an email (visible to all clients) |
+| `PATCH` | `/api/shared/{email}` | Rename a pinned email (update label) |
 | `DELETE` | `/api/shared/{email}` | Unpin an email |
 
 **Request `POST /api/shared`**
@@ -208,15 +209,30 @@ At startup, each provider is probed with a real `create_email` call. Any provide
 
 ---
 
-## MCP server (optional)
+## MCP server
+
+The MCP server is exposed automatically at **`/mcp`** (streamable-http transport) when the FastAPI app runs — no separate process needed.
+
+### HTTP transport (recommended)
+
+Add to your Claude Desktop config (`~/.config/claude/claude_desktop_config.json`):
+
+```json
+{
+  "mcpServers": {
+    "tempmail": {
+      "type": "streamable-http",
+      "url": "http://localhost:8000/mcp"
+    }
+  }
+}
+```
+
+### Standalone stdio mode
 
 ```bash
 python -m src.mcp_server
 ```
-
-Tools exposed: `list_providers`, `get_domains`, `create_email`, `get_messages`, `read_message`, `delete_email`.
-
-Claude Desktop config (`~/.config/claude/claude_desktop_config.json`):
 
 ```json
 {
@@ -229,6 +245,23 @@ Claude Desktop config (`~/.config/claude/claude_desktop_config.json`):
   }
 }
 ```
+
+### Available tools
+
+| Tool | Description |
+|---|---|
+| `list_providers` | List all providers with status (`disabled`, `failures`) |
+| `disable_provider` | Manually disable a provider |
+| `enable_provider` | Re-enable a provider and reset failure counter |
+| `get_domains` | List available domains for a provider |
+| `create_email` | Create a new disposable mailbox |
+| `get_messages` | Poll the inbox for new messages |
+| `read_message` | Read the full body of a message |
+| `delete_email` | Destroy a mailbox |
+| `list_pinned` | List all shared/pinned emails |
+| `pin_email` | Pin a mailbox so all clients can reuse it |
+| `unpin_email` | Remove a pinned email |
+| `rename_email` | Update the display label of a pinned email |
 
 ---
 

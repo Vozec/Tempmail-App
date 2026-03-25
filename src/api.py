@@ -1,10 +1,7 @@
 import asyncio
-import json
 import logging
 import os
-import time
 from contextlib import asynccontextmanager
-from pathlib import Path
 from typing import Optional
 
 from fastapi import APIRouter, Depends, FastAPI, HTTPException, Query
@@ -13,33 +10,10 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from . import registry
+from . import shared_store
 from .providers import EmailAccount, EmailProvider
 
 log = logging.getLogger(__name__)
-
-
-# ---------------------------------------------------------------------------
-# Shared emails store (server-side, visible to all clients)
-# ---------------------------------------------------------------------------
-
-_SHARED_PATH = Path(os.getenv("SHARED_EMAILS_PATH", "shared_emails.json"))
-_shared: list[dict] = []
-
-
-def _load_shared() -> None:
-    global _shared
-    if _SHARED_PATH.exists():
-        try:
-            _shared = json.loads(_SHARED_PATH.read_text())
-        except Exception:
-            _shared = []
-
-
-def _save_shared() -> None:
-    try:
-        _SHARED_PATH.write_text(json.dumps(_shared, indent=2))
-    except Exception as exc:
-        log.warning("shared: could not save %s: %s", _SHARED_PATH, exc)
 
 
 # ---------------------------------------------------------------------------
@@ -48,7 +22,7 @@ def _save_shared() -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    _load_shared()
+    shared_store.load()
     await registry.startup()
     yield
     await registry.shutdown()
@@ -82,6 +56,17 @@ class AccountBody(BaseModel):
     email: str
     token: str
     provider: str
+
+
+class SharedEmailBody(BaseModel):
+    email: str
+    token: str
+    provider: str
+    label: Optional[str] = None
+
+
+class SharedEmailPatch(BaseModel):
+    label: str
 
 
 # ---------------------------------------------------------------------------
@@ -139,8 +124,7 @@ async def create_email(
     Create a new temporary email address.
 
     If `name` is given, use that provider directly.
-    Otherwise, try providers in priority order (mail.tm → gmail → mailticking → …)
-    and return the first success.
+    Otherwise, try providers in priority order and return the first success.
     """
     if name:
         try:
@@ -239,40 +223,33 @@ async def get_domains(provider: EmailProvider = Depends(get_provider)):
 @router.get("/shared", summary="List shared emails", tags=["Shared"])
 async def list_shared():
     """Return all pinned/shared email accounts (visible to every client)."""
-    return _shared
-
-
-class SharedEmailBody(BaseModel):
-    email: str
-    token: str
-    provider: str
-    label: Optional[str] = None
+    return shared_store.all_pinned()
 
 
 @router.post("/shared", summary="Pin an email", tags=["Shared"])
 async def pin_email(body: SharedEmailBody):
     """Pin an email address so all clients can see and use it."""
-    if any(e["email"] == body.email for e in _shared):
-        raise HTTPException(409, f"{body.email!r} is already pinned")
-    _shared.append({
-        "email": body.email,
-        "token": body.token,
-        "provider": body.provider,
-        "label": body.label or "",
-        "pinned_at": int(time.time()),
-    })
-    _save_shared()
-    return _shared[-1]
+    try:
+        return shared_store.pin(body.email, body.token, body.provider, body.label or "")
+    except ValueError as e:
+        raise HTTPException(409, str(e))
+
+
+@router.patch("/shared/{email:path}", summary="Rename a pinned email", tags=["Shared"])
+async def rename_shared_email(email: str, body: SharedEmailPatch):
+    """Update the display label of a pinned email."""
+    entry = shared_store.rename(email, body.label)
+    if entry is None:
+        raise HTTPException(404, f"{email!r} not found in shared list")
+    return entry
 
 
 @router.delete("/shared/{email:path}", summary="Unpin an email", tags=["Shared"])
 async def unpin_email(email: str):
     """Remove a pinned email."""
-    before = len(_shared)
-    _shared[:] = [e for e in _shared if e["email"] != email]
-    if len(_shared) == before:
+    removed = shared_store.unpin(email)
+    if not removed:
         raise HTTPException(404, f"{email!r} not found in shared list")
-    _save_shared()
     return {"unpinned": email}
 
 
@@ -305,10 +282,14 @@ async def health():
 
 
 # ---------------------------------------------------------------------------
-# Mount router + optional static files
+# Mount router + MCP server + optional static files
 # ---------------------------------------------------------------------------
 
 app.include_router(router)
+
+# MCP server exposed at /mcp (streamable-http transport)
+from .mcp_server import mcp  # noqa: E402 — import after registry is defined
+app.mount("/mcp", mcp.streamable_http_app())
 
 _enable_frontend = os.getenv("ENABLE_FRONTEND", "true").lower() not in ("0", "false", "no")
 _static_dir = os.path.join(os.path.dirname(__file__), "static")
