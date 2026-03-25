@@ -21,6 +21,7 @@ async def _lifespan(server: FastMCP):
 
 mcp = FastMCP(
     "TempMail",
+    host="0.0.0.0",
     lifespan=_lifespan,
     streamable_http_path="/",
     instructions=(
